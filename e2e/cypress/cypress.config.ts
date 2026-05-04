@@ -48,6 +48,21 @@ export default defineConfig({
           return authenticator.generate(secret);
         },
       });
+
+      // WebAuthn API は "secure context" (HTTPS / localhost) でしか動かない。
+      // Docker 経由で `host.docker.internal:3000` を叩く e2e 環境では
+      // Chromium に明示的に「この origin は secure 扱いで OK」と教えないと
+      // `navigator.credentials` が undefined になる。
+      on('before:browser:launch', (browser, launchOptions) => {
+        const insecure = process.env.E2E_INSECURE_ORIGIN;
+        if (insecure) {
+          launchOptions.args.push(`--unsafely-treat-insecure-origin-as-secure=${insecure}`);
+          // `--user-data-dir=/tmp/chrome-secure` を一緒に渡さないと Chromium
+          // は flag を unsafe としてシークレットモードで起動するため。
+          launchOptions.args.push('--user-data-dir=/tmp/chrome-secure');
+        }
+        return launchOptions;
+      });
     },
   },
 });

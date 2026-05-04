@@ -62,6 +62,9 @@ describe('WebAuthn (Virtual Authenticator)', () => {
   }
 
   before(() => {
+    // cy.window() を後で使うため、まずアプリページを訪問しておく
+    // (cypress は visit 前に window() を呼ぶとエラーになる)。
+    cy.visit('/');
     cy.resetState();
     cy.registerUser(admin.username, admin.password, true);
     cy.get(`@${admin.username}`).then((res: any) => {
