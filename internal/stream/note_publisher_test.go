@@ -9,6 +9,7 @@ import (
 	"time"
 
 	coredrive "github.com/shiroha-a/mk/internal/core/drive"
+	corenote "github.com/shiroha-a/mk/internal/core/note"
 	corenotification "github.com/shiroha-a/mk/internal/core/notification"
 	"github.com/shiroha-a/mk/internal/entity"
 	"github.com/shiroha-a/mk/internal/misc/id"
@@ -568,6 +569,62 @@ func TestNotificationPublisher_PublishNotification_GatesNoteByVisibility(t *test
 	assert.NotContains(t, string(raw), "secret")
 }
 
+// followers visibility note の著者本人通知 (= TypeNote / poll_ended 等で
+// 著者が自分宛て通知を受ける経路) は notifieeID == n.UserID の early-return
+// で embed が残る。followingChecker 未配線でも author branch が先に効く
+// ことを explicit に固定する (visibility gate が overshoot して著者本人
+// の embed を落としていないかの regression guard)。
+func TestNotificationPublisher_Pack_FollowersNote_AuthorNotifiee_KeepsNote(t *testing.T) {
+	np := NewNotificationPublisher(nil)
+	idGen, _ := id.NewGenerator("aidx")
+	np.SetRepos(
+		&stubNotifUserRepo{user: &model.User{ID: "bob"}},
+		&stubNotifNoteRepo{note: &model.Note{
+			ID:         "note1",
+			UserID:     "bob",
+			Visibility: model.NoteVisibilityFollowers,
+		}},
+		idGen,
+	)
+	// SetFollowingChecker は呼ばない: 本人 branch が follow 判定より先に true。
+	n := &corenotification.Notification{
+		ID:         "x",
+		Type:       corenotification.TypeReply,
+		NotifierID: "alice",
+		NoteID:     "note1",
+	}
+	out := np.Pack("bob", n)
+	body, _ := out.(map[string]any)
+	require.NotNil(t, body)
+	assert.NotNil(t, body["note"], "著者本人 notifiee には followers note embed を残す")
+}
+
+// specified visibility note の著者本人通知も同様に embed が残る。
+func TestNotificationPublisher_Pack_SpecifiedNote_AuthorNotifiee_KeepsNote(t *testing.T) {
+	np := NewNotificationPublisher(nil)
+	idGen, _ := id.NewGenerator("aidx")
+	np.SetRepos(
+		&stubNotifUserRepo{user: &model.User{ID: "bob"}},
+		&stubNotifNoteRepo{note: &model.Note{
+			ID:             "note1",
+			UserID:         "bob",
+			Visibility:     model.NoteVisibilitySpecified,
+			VisibleUserIDs: []string{"charlie"}, // bob 自身は VisibleUserIDs に居ない
+		}},
+		idGen,
+	)
+	n := &corenotification.Notification{
+		ID:         "x",
+		Type:       corenotification.TypeReply,
+		NotifierID: "alice",
+		NoteID:     "note1",
+	}
+	out := np.Pack("bob", n)
+	body, _ := out.(map[string]any)
+	require.NotNil(t, body)
+	assert.NotNil(t, body["note"], "著者本人 notifiee には specified note embed を残す (VisibleUserIDs 不問)")
+}
+
 func strPtr(s string) *string { return &s }
 
 func TestNotificationPublisher_NilPubIsNoOp(t *testing.T) {
@@ -604,6 +661,73 @@ func TestNotificationPublisher_MarshalErrorIsLogged(t *testing.T) {
 		Extra: map[string]any{"ch": make(chan int)},
 	})
 	assert.Empty(t, pub.topics)
+}
+
+// TestNoteVisibleToNotifiee_EquivalentToCanSeeNote pins the stream-side
+// mirror (`noteVisibleToNotifiee`) against `core/note.CanSeeNote`. The two
+// must return the same verdict for every (visibility, notifiee, author,
+// follow-relation, visibleUserIDs) tuple so a future change in CanSeeNote
+// can't silently drift the stream gate (#1471 follow-up)。
+// 比較規則: notifieeID == "" を CanSeeNote の viewer=nil にマップ、
+// それ以外は viewer=&User{ID: notifieeID} にマップ。
+func TestNoteVisibleToNotifiee_EquivalentToCanSeeNote(t *testing.T) {
+	cases := []struct {
+		name           string
+		visibility     model.NoteVisibility
+		notifieeID     string
+		authorID       string
+		visibleUserIDs []string
+		followsAuthor  bool
+		want           bool
+	}{
+		{"public anonymous", model.NoteVisibilityPublic, "", "alice", nil, false, true},
+		{"public viewer", model.NoteVisibilityPublic, "bob", "alice", nil, false, true},
+		{"home anonymous", model.NoteVisibilityHome, "", "alice", nil, false, true},
+		{"home viewer", model.NoteVisibilityHome, "bob", "alice", nil, false, true},
+		{"followers anonymous", model.NoteVisibilityFollowers, "", "alice", nil, false, false},
+		{"followers author", model.NoteVisibilityFollowers, "alice", "alice", nil, false, true},
+		{"followers non-follower", model.NoteVisibilityFollowers, "bob", "alice", nil, false, false},
+		{"followers follower", model.NoteVisibilityFollowers, "bob", "alice", nil, true, true},
+		{"specified anonymous", model.NoteVisibilitySpecified, "", "alice", nil, false, false},
+		{"specified author", model.NoteVisibilitySpecified, "alice", "alice", nil, false, true},
+		{"specified allowed", model.NoteVisibilitySpecified, "bob", "alice", []string{"bob"}, false, true},
+		{"specified denied", model.NoteVisibilitySpecified, "bob", "alice", []string{"charlie"}, false, false},
+		{"unknown visibility", model.NoteVisibility("unknown"), "bob", "alice", nil, false, false},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			n := &model.Note{
+				UserID:         tc.authorID,
+				Visibility:     tc.visibility,
+				VisibleUserIDs: tc.visibleUserIDs,
+			}
+			repo := testutil.NewMockFollowingRepository()
+			if tc.followsAuthor {
+				repo.Followings["f"] = &model.Following{
+					ID:         "f",
+					FollowerID: tc.notifieeID,
+					FolloweeID: tc.authorID,
+				}
+			}
+			var viewer *model.User
+			if tc.notifieeID != "" {
+				viewer = &model.User{ID: tc.notifieeID}
+			}
+			canSee := corenote.CanSeeNote(viewer, n, repo)
+			// MockFollowingRepository は Exists を持つので
+			// NotificationFollowingChecker としても渡せる (compile time に
+			// 満たすことが確認できる minimal interface design)。
+			streamSide := noteVisibleToNotifiee(tc.notifieeID, n, repo)
+			assert.Equal(t, tc.want, canSee, "CanSeeNote baseline mismatch")
+			assert.Equal(t, canSee, streamSide, "stream mirror diverged from CanSeeNote")
+		})
+	}
+
+	// nil note: 両側で false。nil model は table のループに乗せにくいので個別。
+	repo := testutil.NewMockFollowingRepository()
+	assert.False(t, corenote.CanSeeNote(&model.User{ID: "bob"}, nil, repo))
+	assert.False(t, noteVisibleToNotifiee("bob", nil, repo))
 }
 
 // --- DrivePublisher ---------------------------------------------------------

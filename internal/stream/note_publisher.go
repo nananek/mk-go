@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"log/slog"
+	"slices"
 	"sync"
 
 	coredrive "github.com/shiroha-a/mk/internal/core/drive"
@@ -291,12 +292,7 @@ func noteVisibleToNotifiee(notifieeID string, n *model.Note, follow Notification
 		if notifieeID == n.UserID {
 			return true
 		}
-		for _, id := range n.VisibleUserIDs {
-			if id == notifieeID {
-				return true
-			}
-		}
-		return false
+		return slices.Contains(n.VisibleUserIDs, notifieeID)
 	}
 	return false
 }

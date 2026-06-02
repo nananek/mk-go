@@ -13,6 +13,13 @@ import (
 // followingChecker is invoked only when the visibility level requires a follow
 // relationship check; pass nil to skip the check (in which case "followers"
 // notes are treated as invisible to non-author viewers).
+//
+// NOTE: internal/stream/note_publisher.go の noteVisibleToNotifiee に同条件の
+// mirror あり (#1471)。stream package が internal/repository / internal/core/note
+// を import しない方針 (narrow interface pattern) のため inline 再実装している。
+// 本関数の条件 (visibility branch / fail-closed semantics) を変更する際は、
+// stream 側の mirror と internal/stream/note_publisher_test.go の equivalence
+// test (TestNoteVisibleToNotifiee_EquivalentToCanSeeNote) を必ず追従させること。
 func CanSeeNote(viewer *model.User, n *model.Note, followingChecker repository.FollowingRepository) bool {
 	if n == nil {
 		return false
